@@ -1,3 +1,5 @@
+mod support;
+use support::settled as settle;
 use async_trait::async_trait;
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 use syncjetty::*;
@@ -21,6 +23,10 @@ struct Provider {
 }
 #[async_trait]
 impl Drive for Provider {
+    async fn start_changes(&self, _: &Credentials) -> Result<String, ProviderError> { Ok("baseline".into()) }
+    async fn changes(&self, _: &Credentials, _: &str) -> Result<ChangesPage, ProviderError> {
+        Ok(ChangesPage { changes: vec![], next_page: None, new_start: Some("caught-up".into()) })
+    }
     async fn authorize(&self, _: CancellationToken) -> Result<(Identity, Credentials), ProviderError> {
         Ok((Identity { id: "alice-id".into(), email: "alice@example.test".into(), name: "Alice".into(), root_id: "root-alice".into() }, Credentials { access_token: "access-secret".into(), refresh_token: "refresh-secret".into() }))
     }
@@ -41,17 +47,6 @@ impl Drive for Provider {
             incomplete: page.is_none() && *self.incomplete.lock().unwrap(),
         })
     }
-}
-async fn settle(engine: &Engine) -> Snapshot {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let state = engine.command(Command::Snapshot).await.unwrap();
-            if !state.authorizing && !state.accounts.iter().flat_map(|a| &a.listings).any(|l| l.state == Discovery::Loading) {
-                return state;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }).await.unwrap()
 }
 
 #[tokio::test]
@@ -124,4 +119,62 @@ async fn incomplete_first_page_stays_partial_after_restart_and_final_page() {
     settle(&engine).await;
     engine.command(Command::Browse { account_id: "alice-id".into(), folder_id: "root-alice".into(), more: true }).await.unwrap();
     assert_eq!(settle(&engine).await.accounts[0].listings[0].state, Discovery::Complete);
+}
+
+struct MovingDrive {
+    listed: std::sync::atomic::AtomicBool,
+    fail_replay: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl Drive for MovingDrive {
+    async fn authorize(&self, _: CancellationToken) -> Result<(Identity, Credentials), ProviderError> {
+        Ok((Identity { id: "moving".into(), email: "moving@example.test".into(), name: "Moving".into(), root_id: "root".into() }, Credentials { access_token: "access".into(), refresh_token: "refresh".into() }))
+    }
+    async fn refresh(&self, value: &Credentials) -> Result<Credentials, ProviderError> { Ok(value.clone()) }
+    async fn start_changes(&self, _: &Credentials) -> Result<String, ProviderError> {
+        // A cursor captured after listing cannot see the intervening arrival.
+        Ok(if self.listed.load(std::sync::atomic::Ordering::SeqCst) { "too-late" } else { "before-enumeration" }.into())
+    }
+    async fn list(&self, _: &Credentials, _: &str, page: Option<&str>) -> Result<Page, ProviderError> {
+        self.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(Page { entries: vec![], next_page: page.is_none().then(|| "last-page".into()), incomplete: false })
+    }
+    async fn changes(&self, _: &Credentials, cursor: &str) -> Result<ChangesPage, ProviderError> {
+        if self.fail_replay.load(std::sync::atomic::Ordering::SeqCst) { return Err(ProviderError::Unavailable); }
+        let changes = match cursor {
+            "before-enumeration" => vec![MetadataChange { id: "arrival".into(), entry: Some(Entry { id: "arrival".into(), name: "arrived-during-enumeration.txt".into(), mime_type: "text/plain".into(), parents: vec!["root".into()], modified_time: None, size: None }), removed: false }],
+            "replay-page-2" => vec![MetadataChange { id: "arrival".into(), entry: Some(Entry { id: "arrival".into(), name: "renamed-during-replay.txt".into(), mime_type: "text/plain".into(), parents: vec!["root".into()], modified_time: None, size: None }), removed: false }],
+            _ => vec![],
+        };
+        Ok(ChangesPage { changes, next_page: (cursor == "before-enumeration").then(|| "replay-page-2".into()), new_start: (cursor != "before-enumeration").then(|| "caught-up".into()) })
+    }
+}
+
+#[tokio::test]
+async fn paginated_discovery_replays_intervening_changes_and_recovers_after_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("state");
+    let provider = Arc::new(MovingDrive { listed: std::sync::atomic::AtomicBool::new(false), fail_replay: std::sync::atomic::AtomicBool::new(true) });
+    let vault = Arc::new(Vault::default());
+    let open = || Engine::open(&database, Dependencies { drive: provider.clone(), credentials: vault.clone() }).unwrap();
+    let engine = open();
+    engine.command(Command::Connect { reconnect: None }).await.unwrap(); settle(&engine).await;
+    engine.command(Command::Activate { account_id: "moving".into(), mount_path: temp.path().join("mount"), cache_bytes: DEFAULT_CACHE_BYTES, accept_deletion: true }).await.unwrap();
+    let browse = |more| Command::Browse { account_id: "moving".into(), folder_id: "root".into(), more };
+    engine.command(browse(false)).await.unwrap();
+    assert_eq!(settle(&engine).await.accounts[0].listings[0].state, Discovery::Partial);
+    drop(engine);
+    let engine = open();
+    engine.command(browse(true)).await.unwrap();
+    let failed = settle(&engine).await;
+    assert!(matches!(failed.accounts[0].listings[0].state, Discovery::Failed(_)), "Unreplayed concurrent changes must not be reported as a complete empty folder");
+    assert!(failed.accounts[0].listings[0].replay_pending);
+    drop(engine);
+    provider.fail_replay.store(false, std::sync::atomic::Ordering::SeqCst);
+    let engine = open();
+    engine.command(browse(true)).await.unwrap();
+    let complete = settle(&engine).await;
+    assert_eq!(complete.accounts[0].listings[0].state, Discovery::Complete);
+    assert_eq!(complete.accounts[0].listings[0].entries[0].name, "renamed-during-replay.txt");
+    assert_eq!(complete.accounts[0].listings[0].change_cursor.as_deref(), Some("caught-up"));
 }

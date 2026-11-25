@@ -30,6 +30,15 @@ def launch():
     return master, process
 
 
+def resize(rows, columns):
+    global buffer
+    while select.select([master], [], [], 0)[0]:
+        os.read(master, 65536)
+    buffer = b""
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+    os.killpg(process.pid, signal.SIGWINCH)
+
+
 master, process = launch()
 buffer = b""
 
@@ -83,6 +92,12 @@ try:
     expect("PENDING ACTIVATION")
     expect("名前-é-Alice")
     expect("permanent and automatic")
+    resize(10, 80)
+    expect("approval is disabled")
+    key(b"y")
+    expect("approval is disabled")
+    resize(48, 160)
+    expect("PENDING ACTIVATION")
     key(b"m\x15" + str(populated).encode() + b"\r")
     key(b"y")
     expect("Mount location is populated")
@@ -97,6 +112,19 @@ try:
     expect("Incomplete discovery")
     expect("second-page.txt")
     key(b"\r")
+    expect("nested.txt")
+    key(b"\x1b[B\r")
+    expect("> [file] viewport-first.txt")
+    resize(10, 80)
+    expect("alice@example.test")
+    expect("> [file] viewport-first.txt")
+    key(b"\x1b[B")
+    expect("> [file] viewport-second.txt")
+    key(b"\x1b[A")
+    expect("> [file] viewport-first.txt")
+    key(b"\x7f")
+    expect("> [file] nested.txt")
+    resize(48, 160)
     expect("nested.txt")
     key(b"\x7f")
     expect("second-page.txt")

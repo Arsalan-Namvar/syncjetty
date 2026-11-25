@@ -12,6 +12,10 @@ impl CredentialStore for Keyring {
 struct DriveFixture(AtomicUsize);
 #[async_trait]
 impl Drive for DriveFixture {
+    async fn start_changes(&self, _: &Credentials) -> Result<String, ProviderError> { Ok("baseline".into()) }
+    async fn changes(&self, _: &Credentials, _: &str) -> Result<ChangesPage, ProviderError> {
+        Ok(ChangesPage { changes: vec![], next_page: None, new_start: Some("caught-up".into()) })
+    }
     async fn authorize(&self, cancel: CancellationToken) -> Result<(Identity, Credentials), ProviderError> {
         match self.0.fetch_add(1, Ordering::SeqCst) {
             0 => { cancel.cancelled().await; Err(ProviderError::Cancelled) },
@@ -22,10 +26,17 @@ impl Drive for DriveFixture {
     async fn refresh(&self, value: &Credentials) -> Result<Credentials, ProviderError> { Ok(value.clone()) }
     async fn list(&self, _: &Credentials, folder: &str, page: Option<&str>) -> Result<Page, ProviderError> {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let (id, name, mime, next) = if folder == "folder" { ("nested", "nested.txt", "text/plain", None) }
+        let (id, name, mime, next) = if folder == "deep" { ("deep-first", "viewport-first.txt", "text/plain", None) }
+            else if folder == "folder" { ("nested", "nested.txt", "text/plain", None) }
             else if page.is_some() { ("second", "second-page.txt", "text/plain", None) }
             else { ("folder", "Documents", "application/vnd.google-apps.folder", Some("page-2".into())) };
-        Ok(Page { entries: vec![Entry { id: id.into(), name: name.into(), mime_type: mime.into(), parents: vec![folder.into()], size: None, modified_time: None }], next_page: next, incomplete: folder == "my-root" && page.is_none() })
+        let mut entries = vec![Entry { id: id.into(), name: name.into(), mime_type: mime.into(), parents: vec![folder.into()], size: None, modified_time: None }];
+        if folder == "folder" {
+            entries.push(Entry { id: "deep".into(), name: "long-breadcrumb-".repeat(40), mime_type: "application/vnd.google-apps.folder".into(), parents: vec![folder.into()], size: None, modified_time: None });
+        } else if folder == "deep" {
+            entries.push(Entry { id: "deep-second".into(), name: "viewport-second.txt".into(), mime_type: "text/plain".into(), parents: vec![folder.into()], size: None, modified_time: None });
+        }
+        Ok(Page { entries, next_page: next, incomplete: folder == "my-root" && page.is_none() })
     }
 }
 

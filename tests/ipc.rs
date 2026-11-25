@@ -5,6 +5,10 @@ use tokio_util::sync::CancellationToken;
 struct Provider;
 #[async_trait]
 impl Drive for Provider {
+    async fn start_changes(&self, _: &Credentials) -> Result<String, ProviderError> { Ok("baseline".into()) }
+    async fn changes(&self, _: &Credentials, _: &str) -> Result<ChangesPage, ProviderError> {
+        Ok(ChangesPage { changes: vec![], next_page: None, new_start: Some("caught-up".into()) })
+    }
     async fn authorize(&self, _: CancellationToken) -> Result<(Identity, Credentials), ProviderError> {
         Ok((Identity { id: "account".into(), email: "account@example.test".into(), name: "Account".into(), root_id: "root".into() }, Credentials { access_token: "access".into(), refresh_token: "refresh".into() }))
     }

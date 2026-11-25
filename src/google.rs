@@ -4,7 +4,7 @@
 //! Publisher credentials are embedded at build time; users never edit OAuth config.
 //! Protocol reference: https://developers.google.com/identity/protocols/oauth2/native-app
 
-use crate::{CredentialStore, Credentials, Drive, Entry, Identity, Page, ProviderError};
+use crate::{ChangesPage, CredentialStore, Credentials, Drive, Entry, Identity, MetadataChange, Page, ProviderError};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{RngCore, rngs::OsRng};
@@ -194,7 +194,7 @@ impl Drive for Google {
     async fn list(&self, credentials: &Credentials, folder: &str, page: Option<&str>) -> Result<Page, ProviderError> {
         // Strict IDs exclude quote/backslash characters, so none can escape the
         // Drive query literal or introduce another query predicate.
-        if !valid_id(folder) || page.is_some_and(|p| p.is_empty() || p.len() > 8192 || p.chars().any(char::is_control)) {
+        if !valid_id(folder) || page.is_some_and(|token| !valid_page_token(token)) {
             return Err(ProviderError::InvalidResponse);
         }
         if credentials.access_token.is_empty() {
@@ -221,20 +221,91 @@ impl Drive for Google {
             !valid_id(&file.id) || file.mime_type.is_empty()
                 || file.parents.iter().any(|id| !valid_id(id))
                 || !file.parents.iter().any(|id| id == folder)
-        }) || listing.next_page_token.as_ref().is_some_and(|p| p.is_empty() || p.len() > 8192 || p.chars().any(char::is_control)) {
+        }) || listing.next_page_token.as_ref().is_some_and(|token| !valid_page_token(token)) {
             return Err(ProviderError::InvalidResponse);
         }
         Ok(Page {
-            entries: listing.files.into_iter().map(|file| Entry {
-                id: file.id,
-                name: file.name,
-                mime_type: file.mime_type,
-                parents: file.parents,
-                modified_time: file.modified_time,
-                size: file.size,
-            }).collect(),
+            entries: listing.files.into_iter().map(DriveFile::into_entry).collect(),
             next_page: listing.next_page_token,
             incomplete: listing.incomplete_search,
+        })
+    }
+
+    async fn start_changes(&self, credentials: &Credentials) -> Result<String, ProviderError> {
+        if credentials.access_token.is_empty() {
+            return Err(ProviderError::Unauthorized);
+        }
+        // User-scoped token: getStartPageToken has no restrictToMyDrive parameter.
+        let response = self.client.get(format!("{DRIVE_URL}/changes/startPageToken"))
+            .bearer_auth(&credentials.access_token)
+            .query(&[("fields", "startPageToken")])
+            .send().await.map_err(|_| ProviderError::Unavailable)?;
+        let start: StartPageToken = metadata_json(response).await?;
+        if !valid_page_token(&start.start_page_token) {
+            return Err(ProviderError::InvalidResponse);
+        }
+        Ok(start.start_page_token)
+    }
+
+    async fn changes(&self, credentials: &Credentials, cursor: &str) -> Result<ChangesPage, ProviderError> {
+        if !valid_page_token(cursor) {
+            return Err(ProviderError::InvalidResponse);
+        }
+        if credentials.access_token.is_empty() {
+            return Err(ProviderError::Unauthorized);
+        }
+        let response = self.client.get(format!("{DRIVE_URL}/changes"))
+            .bearer_auth(&credentials.access_token)
+            .query(&[
+                ("pageToken", cursor),
+                ("pageSize", "1000"),
+                ("spaces", "drive"),
+                ("restrictToMyDrive", "true"),
+                ("includeRemoved", "true"),
+                ("includeItemsFromAllDrives", "false"),
+                ("fields", "changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,size,trashed)),nextPageToken,newStartPageToken"),
+            ])
+            .send().await.map_err(|_| ProviderError::Unavailable)?;
+        if matches!(response.status(), StatusCode::BAD_REQUEST | StatusCode::GONE) {
+            return Err(ProviderError::Configuration(
+                "Google rejected the metadata change cursor. Retry discovery to start a fresh metadata enumeration.".into(),
+            ));
+        }
+        let listing: ChangeList = metadata_json(response).await?;
+        if listing.changes.len() > 1000
+            || listing.next_page_token.is_some() == listing.new_start_page_token.is_some()
+            || listing.next_page_token.as_ref().is_some_and(|token| !valid_page_token(token))
+            || listing.new_start_page_token.as_ref().is_some_and(|token| !valid_page_token(token))
+        {
+            return Err(ProviderError::InvalidResponse);
+        }
+        let mut changes = Vec::with_capacity(listing.changes.len());
+        for change in listing.changes {
+            if !valid_id(&change.file_id) {
+                return Err(ProviderError::InvalidResponse);
+            }
+            if let Some(file) = &change.file {
+                if !valid_id(&file.id) || file.id != change.file_id || file.mime_type.is_empty()
+                    || file.parents.iter().any(|id| !valid_id(id))
+                {
+                    return Err(ProviderError::InvalidResponse);
+                }
+            } else if !change.removed {
+                return Err(ProviderError::InvalidResponse);
+            }
+            // Removal can mean lost access; trash is also uncertainty, never
+            // authorization to delete local or remote contents.
+            let removed = change.removed || change.file.as_ref().is_some_and(|file| file.trashed);
+            changes.push(MetadataChange {
+                id: change.file_id,
+                entry: if removed { None } else { change.file.map(DriveFile::into_entry) },
+                removed,
+            });
+        }
+        Ok(ChangesPage {
+            changes,
+            next_page: listing.next_page_token,
+            new_start: listing.new_start_page_token,
         })
     }
 }
@@ -252,6 +323,10 @@ fn random_token() -> Result<Zeroizing<String>, ProviderError> {
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn valid_page_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 8192 && !token.chars().any(char::is_control)
 }
 
 async fn receive_callback(listener: &TcpListener, host: &str, state: &str) -> Result<Zeroizing<String>, ProviderError> {
@@ -449,6 +524,25 @@ struct FileList {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct StartPageToken { start_page_token: String }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChangeList {
+    #[serde(default)]
+    changes: Vec<DriveChange>,
+    next_page_token: Option<String>,
+    new_start_page_token: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveChange {
+    file_id: String,
+    #[serde(default)]
+    removed: bool,
+    file: Option<DriveFile>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DriveFile {
     id: String,
     name: String,
@@ -457,6 +551,21 @@ struct DriveFile {
     parents: Vec<String>,
     modified_time: Option<String>,
     size: Option<String>,
+    #[serde(default)]
+    trashed: bool,
+}
+
+impl DriveFile {
+    fn into_entry(self) -> Entry {
+        Entry {
+            id: self.id,
+            name: self.name,
+            mime_type: self.mime_type,
+            parents: self.parents,
+            modified_time: self.modified_time,
+            size: self.size,
+        }
+    }
 }
 
 /// Stores only the long-lived refresh token in the desktop's Secret Service.

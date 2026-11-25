@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 pub struct Engine(Arc<Shared>);
 struct Shared {
     state: Mutex<State>,
+    publication: Mutex<()>,
     dependencies: Dependencies,
 }
 struct State {
@@ -68,15 +69,23 @@ impl Engine {
         }
         let mut state = State { database, snapshot, authorization: CancellationToken::new(), generation: 0 };
         state.persist()?;
-        Ok(Self(Arc::new(Shared { state: Mutex::new(state), dependencies })))
+        Ok(Self(Arc::new(Shared { state: Mutex::new(state), publication: Mutex::new(()), dependencies })))
     }
 
     /// Connect and Browse enqueue bounded work; consumers poll Snapshot for progress.
     pub async fn command(&self, command: Command) -> Result<Snapshot> {
+        let _publication = if matches!(command, Command::Cancel | Command::Connect { .. }) {
+            Some(self.0.publication.lock().await)
+        } else { None };
         let mut state = self.0.state.lock().await;
         match command {
             Command::Snapshot => {},
             Command::Cancel => {
+                if !state.snapshot.authorizing {
+                    state.snapshot.notice = Some("No authorization is pending; any completed account connection is retained".into());
+                    state.persist()?;
+                    return Ok(state.snapshot.clone());
+                }
                 state.authorization.cancel();
                 state.generation += 1;
                 state.snapshot.authorizing = false;
@@ -125,14 +134,22 @@ impl Engine {
                 let index = match account.listings.iter().position(|l| l.folder_id == folder_id) {
                     Some(index) => index,
                     None => {
-                        account.listings.push(Listing { folder_id: folder_id.clone(), entries: Vec::new(), state: Discovery::NotStarted, next_page: None, last_success: None, incomplete: false });
+                        account.listings.push(Listing { folder_id: folder_id.clone(), entries: Vec::new(), state: Discovery::NotStarted, next_page: None, last_success: None, incomplete: false, change_cursor: None, replay_pending: false });
                         account.listings.len() - 1
                     }
                 };
                 let listing = &mut account.listings[index];
                 anyhow::ensure!(listing.state != Discovery::Loading, "This folder is already loading");
-                let page = if more { Some(listing.next_page.clone().context("No next page; refresh instead")?) } else { None };
-                if !more { listing.next_page = None; listing.incomplete = false; }
+                let page = if more {
+                    anyhow::ensure!(listing.next_page.is_some() || listing.replay_pending, "No next page or interrupted replay; refresh instead");
+                    listing.next_page.clone()
+                } else { None };
+                if !more {
+                    listing.next_page = None;
+                    listing.incomplete = false;
+                    listing.change_cursor = None;
+                    listing.replay_pending = false;
+                }
                 listing.state = Discovery::Loading;
                 state.persist()?;
                 let engine = self.clone();
@@ -143,8 +160,14 @@ impl Engine {
     }
 
     async fn authorize(&self, generation: u64, cancel: CancellationToken, reconnect: Option<String>) {
+        let authorized = self.0.dependencies.drive.authorize(cancel.clone()).await;
+        let _publication = self.0.publication.lock().await;
+        {
+            let state = self.0.state.lock().await;
+            if state.generation != generation || cancel.is_cancelled() { return; }
+        }
         let result = async {
-            let (identity, credentials) = self.0.dependencies.drive.authorize(cancel.clone()).await?;
+            let (identity, credentials) = authorized?;
             anyhow::ensure!(!identity.id.is_empty() && !identity.root_id.is_empty() && !identity.email.is_empty(), "Google returned incomplete account identity");
             if let Some(id) = &reconnect {
                 anyhow::ensure!(id == &identity.id, "Reconnection returned a different Google account; existing account is unchanged");
@@ -180,52 +203,121 @@ impl Engine {
     }
 
     async fn browse(&self, account_id: String, folder_id: String, page: Option<String>) {
-        let result = async {
-            let store = self.0.dependencies.credentials.clone();
-            let id = account_id.clone();
-            let credentials = tokio::task::spawn_blocking(move || store.load(&id)).await
-                .map_err(|_| ProviderError::Unavailable)?
-                .map_err(|_| ProviderError::Configuration("Unlock the desktop keyring, then retry or reconnect".into()))?;
-            let credentials = self.0.dependencies.drive.refresh(&credentials).await?;
-            let store = self.0.dependencies.credentials.clone();
-            let id = account_id.clone();
-            let saved = credentials.clone();
-            tokio::task::spawn_blocking(move || store.save(&id, &saved)).await
-                .map_err(|_| ProviderError::Unavailable)?
-                .map_err(|_| ProviderError::Configuration("Cannot securely save refreshed authorization; unlock the desktop keyring".into()))?;
-            self.0.dependencies.drive.list(&credentials, &folder_id, page.as_deref()).await
-        }.await;
-        let mut state = self.0.state.lock().await;
-        let Some(account) = state.snapshot.accounts.iter_mut().find(|a| a.identity.id == account_id) else { return; };
-        let Some(listing) = account.listings.iter_mut().find(|l| l.folder_id == folder_id) else { return; };
-        match result {
-            Ok(page) => {
-                // Absence is not deletion. Retain last-known entries even after re-enumeration.
-                if page.entries.iter().any(|entry| entry.id.is_empty() || entry.name.is_empty() || !entry.parents.contains(&folder_id)) {
-                    listing.state = Discovery::Failed("Invalid metadata; last-known entries retained. Retry discovery.".into());
-                    let _ = state.persist();
-                    return;
-                }
-                let mut positions: std::collections::HashMap<String, usize> = listing.entries.iter().enumerate().map(|(index, entry)| (entry.id.clone(), index)).collect();
-                for entry in page.entries {
-                    if let Some(&index) = positions.get(&entry.id) { listing.entries[index] = entry; }
-                    else {
-                        positions.insert(entry.id.clone(), listing.entries.len());
-                        listing.entries.push(entry);
-                    }
-                }
-                listing.next_page = page.next_page;
-                listing.incomplete |= page.incomplete;
-                listing.state = if listing.incomplete || listing.next_page.is_some() { Discovery::Partial } else { Discovery::Complete };
-                listing.last_success = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
-            },
-            Err(error) => {
-                if matches!(error, ProviderError::Unauthorized) { account.needs_reconnect = true; }
+        if let Err(error) = self.discover(&account_id, &folder_id, page.as_deref()).await {
+            let mut state = self.0.state.lock().await;
+            let Some(account) = state.snapshot.accounts.iter_mut().find(|a| a.identity.id == account_id) else { return; };
+            if matches!(error, ProviderError::Unauthorized) { account.needs_reconnect = true; }
+            if let Some(listing) = account.listings.iter_mut().find(|l| l.folder_id == folder_id) {
                 listing.state = Discovery::Failed(error.to_string());
-            },
+            }
+            if state.persist().is_err() {
+                state.snapshot.notice = Some("Cannot persist discovery progress; check local storage and retry".into());
+            }
         }
-        if state.persist().is_err() {
-            state.snapshot.notice = Some("Cannot persist discovery progress; check local storage and retry".into());
+    }
+
+    async fn discover(&self, account_id: &str, folder_id: &str, page: Option<&str>) -> Result<(), ProviderError> {
+        let store = self.0.dependencies.credentials.clone();
+        let id = account_id.to_owned();
+        let credentials = tokio::task::spawn_blocking(move || store.load(&id)).await
+            .map_err(|_| ProviderError::Unavailable)?
+            .map_err(|_| ProviderError::Configuration("Unlock the desktop keyring, then retry or reconnect".into()))?;
+        let credentials = self.0.dependencies.drive.refresh(&credentials).await?;
+        let store = self.0.dependencies.credentials.clone();
+        let id = account_id.to_owned();
+        let saved = credentials.clone();
+        tokio::task::spawn_blocking(move || store.save(&id, &saved)).await
+            .map_err(|_| ProviderError::Unavailable)?
+            .map_err(|_| ProviderError::Configuration("Cannot securely save refreshed authorization; unlock the desktop keyring".into()))?;
+        let (cursor, replay) = {
+            let state = self.0.state.lock().await;
+            let listing = find_listing(&state.snapshot, account_id, folder_id)?;
+            (listing.change_cursor.clone(), listing.replay_pending)
+        };
+        if cursor.is_none() {
+            if page.is_some() || replay {
+                return Err(ProviderError::Configuration("This inventory predates changes tracking; refresh discovery from its first page".into()));
+            }
+            // Capture and commit the baseline BEFORE any files.list request.
+            let cursor = self.0.dependencies.drive.start_changes(&credentials).await?;
+            let mut state = self.0.state.lock().await;
+            find_listing_mut(&mut state.snapshot, account_id, folder_id)?.change_cursor = Some(cursor);
+            persist_discovery(&mut state)?;
+        }
+        if !replay {
+            let page = self.0.dependencies.drive.list(&credentials, folder_id, page).await?;
+            if page.entries.iter().any(|entry| entry.id.is_empty() || entry.name.is_empty() || !entry.parents.iter().any(|id| id == folder_id)) {
+                return Err(ProviderError::InvalidResponse);
+            }
+            let mut state = self.0.state.lock().await;
+            let listing = find_listing_mut(&mut state.snapshot, account_id, folder_id)?;
+            merge_entries(&mut listing.entries, page.entries);
+            listing.next_page = page.next_page;
+            listing.incomplete |= page.incomplete;
+            listing.replay_pending = listing.next_page.is_none();
+            listing.state = if listing.replay_pending { Discovery::Loading } else { Discovery::Partial };
+            let more = listing.next_page.is_some();
+            persist_discovery(&mut state)?;
+            if more { return Ok(()); }
+        }
+        loop {
+            let cursor = {
+                let state = self.0.state.lock().await;
+                find_listing(&state.snapshot, account_id, folder_id)?.change_cursor.clone().ok_or(ProviderError::InvalidResponse)?
+            };
+            let changes = self.0.dependencies.drive.changes(&credentials, &cursor).await?;
+            if changes.next_page.is_some() == changes.new_start.is_some()
+                || changes.next_page.as_ref() == Some(&cursor)
+                || changes.changes.iter().any(|change| change.id.is_empty() || (!change.removed && change.entry.as_ref().is_none_or(|entry| entry.id != change.id || entry.name.is_empty()))) {
+                return Err(ProviderError::InvalidResponse);
+            }
+            let mut state = self.0.state.lock().await;
+            let listing = find_listing_mut(&mut state.snapshot, account_id, folder_id)?;
+            let mut entries = Vec::new();
+            for change in changes.changes {
+                if change.removed {
+                    // Removed includes loss of access: never infer a destructive deletion.
+                    listing.incomplete = true;
+                } else if let Some(entry) = change.entry {
+                    if entry.parents.iter().any(|parent| parent == folder_id) { entries.push(entry); }
+                    else if listing.entries.iter().any(|known| known.id == entry.id) { listing.incomplete = true; }
+                }
+            }
+            merge_entries(&mut listing.entries, entries);
+            let finished = changes.next_page.is_none();
+            listing.change_cursor = changes.next_page.or(changes.new_start);
+            listing.replay_pending = !finished;
+            if finished {
+                listing.state = if listing.incomplete { Discovery::Partial } else { Discovery::Complete };
+                listing.last_success = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+            }
+            persist_discovery(&mut state)?;
+            if finished { return Ok(()); }
+        }
+    }
+}
+
+fn find_listing<'a>(snapshot: &'a Snapshot, account: &str, folder: &str) -> Result<&'a Listing, ProviderError> {
+    snapshot.accounts.iter().find(|a| a.identity.id == account)
+        .and_then(|a| a.listings.iter().find(|l| l.folder_id == folder)).ok_or(ProviderError::InvalidResponse)
+}
+
+fn find_listing_mut<'a>(snapshot: &'a mut Snapshot, account: &str, folder: &str) -> Result<&'a mut Listing, ProviderError> {
+    snapshot.accounts.iter_mut().find(|a| a.identity.id == account)
+        .and_then(|a| a.listings.iter_mut().find(|l| l.folder_id == folder)).ok_or(ProviderError::InvalidResponse)
+}
+
+fn persist_discovery(state: &mut State) -> Result<(), ProviderError> {
+    state.persist().map_err(|_| ProviderError::Configuration("Cannot persist discovery progress; fix local storage and retry".into()))
+}
+
+fn merge_entries(known: &mut Vec<Entry>, entries: Vec<Entry>) {
+    let mut positions: std::collections::HashMap<String, usize> = known.iter().enumerate().map(|(index, entry)| (entry.id.clone(), index)).collect();
+    for entry in entries {
+        if let Some(&index) = positions.get(&entry.id) { known[index] = entry; }
+        else {
+            positions.insert(entry.id.clone(), known.len());
+            known.push(entry);
         }
     }
 }

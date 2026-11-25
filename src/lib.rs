@@ -51,6 +51,20 @@ pub struct Page {
     pub incomplete: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct MetadataChange {
+    pub id: String,
+    pub entry: Option<Entry>,
+    pub removed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ChangesPage {
+    pub changes: Vec<MetadataChange>,
+    pub next_page: Option<String>,
+    pub new_start: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Discovery {
     NotStarted,
@@ -69,6 +83,10 @@ pub struct Listing {
     pub last_success: Option<u64>,
     #[serde(default)]
     pub incomplete: bool,
+    #[serde(default)]
+    pub change_cursor: Option<String>,
+    #[serde(default)]
+    pub replay_pending: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -124,6 +142,8 @@ pub trait Drive: Send + Sync {
     async fn authorize(&self, cancel: CancellationToken) -> Result<(Identity, Credentials), ProviderError>;
     async fn refresh(&self, credentials: &Credentials) -> Result<Credentials, ProviderError>;
     async fn list(&self, credentials: &Credentials, folder: &str, page: Option<&str>) -> Result<Page, ProviderError>;
+    async fn start_changes(&self, credentials: &Credentials) -> Result<String, ProviderError>;
+    async fn changes(&self, credentials: &Credentials, cursor: &str) -> Result<ChangesPage, ProviderError>;
 }
 
 /// Secret Service in production; isolated credential storage in acceptance tests.

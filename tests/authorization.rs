@@ -1,3 +1,5 @@
+mod support;
+use support::settled;
 use async_trait::async_trait;
 use std::{collections::HashMap, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}};
 use syncjetty::*;
@@ -16,6 +18,10 @@ struct Google {
 }
 #[async_trait]
 impl Drive for Google {
+    async fn start_changes(&self, _: &Credentials) -> Result<String, ProviderError> { Ok("baseline".into()) }
+    async fn changes(&self, _: &Credentials, _: &str) -> Result<ChangesPage, ProviderError> {
+        Ok(ChangesPage { changes: vec![], next_page: None, new_start: Some("caught-up".into()) })
+    }
     async fn authorize(&self, cancel: CancellationToken) -> Result<(Identity, Credentials), ProviderError> {
         if self.wait_for_cancel.load(Ordering::SeqCst) {
             cancel.cancelled().await;
@@ -31,15 +37,6 @@ impl Drive for Google {
         assert_eq!(folder, format!("root-{}", value.access_token));
         Ok(Page { entries: vec![Entry { id: format!("file-{}", value.access_token), name: "same-name.txt".into(), mime_type: "text/plain".into(), parents: vec![folder.into()], modified_time: None, size: Some("7".into()) }], next_page: None, incomplete: false })
     }
-}
-async fn settled(engine: &Engine) -> Snapshot {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let snapshot = engine.command(Command::Snapshot).await.unwrap();
-            if !snapshot.authorizing && !snapshot.accounts.iter().flat_map(|a| &a.listings).any(|l| l.state == Discovery::Loading) { return snapshot; }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    }).await.unwrap()
 }
 
 #[tokio::test]
@@ -97,4 +94,48 @@ async fn four_accounts_keep_same_named_files_and_credentials_isolated() {
     for account in snapshot.accounts {
         assert_eq!(account.listings[0].entries[0].id, format!("file-{}", account.identity.id));
     }
+}
+
+struct DelayedSecrets {
+    values: Mutex<HashMap<String, Credentials>>,
+    entered: tokio::sync::Notify,
+    release: (Mutex<bool>, std::sync::Condvar),
+    delay: AtomicBool,
+}
+impl CredentialStore for DelayedSecrets {
+    fn load(&self, id: &str) -> anyhow::Result<Credentials> {
+        self.values.lock().unwrap().get(id).cloned().ok_or_else(|| anyhow::anyhow!("absent"))
+    }
+    fn save(&self, id: &str, value: &Credentials) -> anyhow::Result<()> {
+        if self.delay.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            let mut released = self.release.0.lock().unwrap();
+            while !*released { released = self.release.1.wait(released).unwrap(); }
+        }
+        self.values.lock().unwrap().insert(id.into(), value.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancellation_does_not_acknowledge_while_credential_publication_is_in_flight() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Google { identity: Mutex::new("alice".into()), wait_for_cancel: AtomicBool::new(false), revoked: AtomicBool::new(false) });
+    let vault = Arc::new(DelayedSecrets { values: Mutex::new(HashMap::new()), entered: tokio::sync::Notify::new(), release: (Mutex::new(false), std::sync::Condvar::new()), delay: AtomicBool::new(true) });
+    let engine = Engine::open(&temp.path().join("state"), Dependencies { drive: provider, credentials: vault.clone() }).unwrap();
+    engine.command(Command::Connect { reconnect: None }).await.unwrap();
+    vault.entered.notified().await;
+    let mut cancel = Box::pin(engine.command(Command::Cancel));
+    let premature_ack = tokio::time::timeout(std::time::Duration::from_millis(50), &mut cancel).await;
+    // Always release the external helper, including on the old broken implementation.
+    *vault.release.0.lock().unwrap() = true;
+    vault.release.1.notify_all();
+    assert!(premature_ack.is_err(), "Cancellation acknowledged while a keyring write could still replace credentials");
+    let snapshot = cancel.await.unwrap();
+    assert!(!snapshot.authorizing);
+    assert_eq!(snapshot.accounts[0].identity.id, "alice");
+    assert!(!snapshot.notice.unwrap().contains("existing accounts are unchanged"));
+    engine.command(Command::Activate { account_id: "alice".into(), mount_path: temp.path().join("mount"), cache_bytes: DEFAULT_CACHE_BYTES, accept_deletion: true }).await.unwrap();
+    engine.command(Command::Browse { account_id: "alice".into(), folder_id: "root-alice".into(), more: false }).await.unwrap();
+    assert_eq!(settled(&engine).await.accounts[0].listings[0].entries[0].id, "file-alice");
 }

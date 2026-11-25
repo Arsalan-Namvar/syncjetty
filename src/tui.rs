@@ -72,8 +72,8 @@ impl View {
         let Some(account) = self.account().filter(|account| account.activated) else { return; };
         let account_id = account.identity.id.clone();
         let folder_id = self.folder().unwrap().0.to_owned();
-        if more && !account.listings.iter().any(|listing| listing.folder_id == folder_id && listing.next_page.is_some()) {
-            self.error = Some("No next page is available".into()); return;
+        if more && !account.listings.iter().any(|listing| listing.folder_id == folder_id && (listing.next_page.is_some() || listing.replay_pending)) {
+            self.error = Some("No next page or interrupted changes replay is available".into()); return;
         }
         if self.send(sender, Command::Browse { account_id: account_id.clone(), folder_id: folder_id.clone(), more }) {
             self.requested.insert((account_id, folder_id));
@@ -253,12 +253,33 @@ fn draw(view: &mut View) -> Result<()> {
                         Discovery::Failed(error) => format!("Discovery failed: {error}. Previous entries are retained; f retries"),
                     };
                     wrap(&mut lines, &status, width);
-                    lines.push(format!("{} entries | next page: {}", listing.entries.len(), if listing.next_page.is_some() { "available (n)" } else { "none" }));
+                    lines.push(format!("{} entries | next page: {}", listing.entries.len(), if listing.replay_pending { "changes replay pending (n resumes)" } else if listing.next_page.is_some() { "available (n)" } else { "none" }));
                     wrap(&mut lines, &format!("Last successful page check (Unix seconds): {}", listing.last_success.map_or_else(|| "never".into(), |time| time.to_string())), width);
                     if let Some(entry) = listing.entries.get(view.selected.min(listing.entries.len().saturating_sub(1))) {
                         wrap(&mut lines, &format!("Selected ID: {} | type: {} | size: {} | modified: {}", entry.id, entry.mime_type, entry.size.as_deref().unwrap_or("n/a"), entry.modified_time.as_deref().unwrap_or("unknown")), width);
                     }
-                    let visible = height.saturating_sub(lines.len() + 1).max(1);
+                    // Browsing must keep the selected entry on screen even when
+                    // paths or metadata wrap. Activation reviews deliberately do
+                    // not use this compact layout: approval requires every line.
+                    let reserved = listing.entries.len().clamp(1, 3).min(height.saturating_sub(4).max(1));
+                    let header_budget = height.saturating_sub(reserved);
+                    if lines.len() > header_budget {
+                        lines = vec![
+                            format!("Account {}/{}: {} ({})", view.account + 1, view.snapshot.accounts.len(), account.identity.email, account.identity.name),
+                            "c connect | Esc cancel | r reconnect | Tab account | q close".into(),
+                            "Up/Down select | Enter folder | Backspace parent | n next | f retry".into(),
+                            "Syncjetty | My Drive metadata only | no mounted filesystem".into(),
+                        ];
+                        // Optional context is clipped to one row each, rather
+                        // than allowing unbounded breadcrumbs to bury entries.
+                        for context in [format!("Folder: {hierarchy} | stable ID: {folder}"), status,
+                            format!("{} entries | next page: {}", listing.entries.len(), if listing.replay_pending { "changes replay pending (n resumes)" } else if listing.next_page.is_some() { "available (n)" } else { "none" })] {
+                            if lines.len() >= header_budget { break; }
+                            lines.push(context);
+                        }
+                        lines.truncate(header_budget);
+                    }
+                    let visible = height.saturating_sub(lines.len()).max(1);
                     let selected = view.selected.min(listing.entries.len().saturating_sub(1));
                     let start = selected.saturating_sub(visible.saturating_sub(1));
                     for (index, entry) in listing.entries.iter().enumerate().skip(start).take(visible) {

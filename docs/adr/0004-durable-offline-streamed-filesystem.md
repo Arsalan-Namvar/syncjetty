@@ -1,0 +1,7 @@
+# Preserve local saves and offline work in the streamed filesystem
+
+The first supported environment is Arch Linux x86-64 with systemd, on Wayland and X11; FUSE is an allowed filesystem dependency. Cached and pinned files remain readable and editable offline, last-known directories remain visible, uncached opens fail promptly rather than return empty contents, and local creates, renames, moves, and deletions queue for reconciliation. A successful save means durable local contents, not completed cloud upload; acknowledged saves must survive process crashes, with local disk failure an explicit remaining risk until upload completes.
+
+Local symbolic-link creation is rejected rather than followed or uploaded; Drive shortcuts retain their separate target-link semantics. Duplicate sibling names and Linux-incompatible remote names require explicit remote renaming before filesystem exposure; the user selected this over stable local-name mappings. Unrenameable affected entries remain accessible through the resolution panel rather than being silently renamed or omitted without explanation.
+
+Closing either interface leaves background synchronization active. Explicit Quit stops synchronization and safely unmounts drives without forcing busy files; account disconnection requires pending uploads and conflicts to be resolved or explicitly exported before credentials and cached contents are removed. These requirements prioritize preserving local data over immediate completion of disconnect or shutdown actions.

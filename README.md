@@ -16,4 +16,6 @@ cargo check --all-targets --locked
 cargo test --locked
 ```
 
-Tests cross the public engine control/state seam using isolated external adapters. They do not replace live Google, Secret Service, or desktop acceptance. See [verification evidence](docs/verification-ticket-2.md) for observed checks and remaining prerequisites.
+The [Rust CI workflow](.github/workflows/rust.yml) runs these exact commands on Ubuntu 24.04 with Rust 1.100.0 for pull requests targeting `main` and pushes to `main`. Its stable merge-check name is `Rust checks`; either command failing fails that job. The job has a 15-minute timeout and read-only repository permissions.
+
+Deterministic engine, IPC, authorization, and Python 3 PTY tests use isolated external adapters without publisher OAuth values, Google access, a real desktop session, or the user's Secret Service. No secrets or live consent are needed for CI. These tests do not replace opt-in live Google, Secret Service, or desktop acceptance: follow [authorized live acceptance](docs/publisher-oauth.md) only with explicit authorization. See [verification evidence](docs/verification-ticket-2.md) for observed live checks and remaining prerequisites.
